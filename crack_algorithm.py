@@ -182,3 +182,101 @@ def draw_crack(img, x, y, angle, length, depth=CRACK_DEPTH):
     img[mask3] = blended[mask3]
 
 
+
+def draw_center_crack(img, x, y, angle, length, depth=CRACK_DEPTH):
+    if depth <= 0 or length < 3:
+        return
+
+    h, w = img.shape[:2]
+
+    # 1. Build crack skeleton
+    crack_mask = np.zeros((h, w), dtype=np.uint8)
+    points    = []
+    cur_x     = float(x)
+    cur_y     = float(y)
+    cur_angle = angle
+
+    for i in range(int(length)):
+        cur_angle += np.random.uniform(-1, 1)
+        cur_x     += np.cos(np.radians(cur_angle)) * np.random.uniform(0.8, 1.5)
+        cur_y     += np.sin(np.radians(cur_angle)) * np.random.uniform(0.8, 1.5)
+        ix, iy = int(cur_x), int(cur_y)
+        if 0 <= ix < w and 0 <= iy < h:
+            half = length / 2
+
+            if i <= half:
+                # Increase width
+                px_width = max(1, int(depth * (1 +  0.4 * i / half)))
+            else:
+                # Decrease width
+                px_width = max(1, int(depth * (1 + 0.4 * (1 - (i - half) / half))))
+
+            cv2.circle(crack_mask, (ix, iy), px_width, 255, -1)
+            points.append((ix, iy))
+
+    if len(points) > 2:
+        cv2.polylines(crack_mask, [np.array(points)], False, 255, 1)
+
+    if crack_mask.sum() == 0:
+        return
+
+    # 2. Perlin noise
+    ys, xs = np.where(crack_mask > 0)
+    x0, x1 = xs.min(), xs.max() + 1
+    y0, y1 = ys.min(), ys.max() + 1
+    patch_h = max(y1 - y0, 4)
+    patch_w = max(x1 - x0, 4)
+
+    perm        = make_perm()
+    noise_patch = perlin_patch(
+        patch_h,
+         patch_w,
+            scale=PERLIN_SCALE,
+            perm=perm)
+    noise_canvas = np.zeros((h, w), dtype=np.float32)
+    noise_canvas[y0:y1, x0:x1] = noise_patch
+    # 3. Distance transform
+    dist = cv2.distanceTransform(crack_mask, cv2.DIST_L2, 3)
+    dist_n = dist / (dist.max() + 1e-6)
+
+    # Start with normalized distance
+    alpha = dist_n.copy()
+
+    # Smooth Perlin noise
+    noise_smooth = cv2.GaussianBlur(noise_canvas, (5,5), 1.2)
+    #noise_mod = 0.75 + 0.25 * noise_smooth
+    noise_mod = 0.75 + 0.25 * noise_smooth
+    # Apply Perlin texture
+    alpha *= noise_mod
+
+    # Nonlinear threshold (sigmoid)
+    alpha = 1.0 / (1.0 + np.exp(-10 * (alpha - 0.45)))
+
+    # Smooth crack edge
+    alpha = cv2.GaussianBlur(alpha, (3,3), 0.8)
+
+    # Restrict to crack region
+    alpha = np.where(crack_mask > 0, alpha, 0.0)
+    alpha = np.clip(alpha, 0, 1)
+    # 4. Crack colour — pure darkening, strength controls how black the centre is
+    img_f = img.astype(np.float32)
+
+    variation = cv2.GaussianBlur(noise_canvas, (3, 3), 0)
+    variation  = 0.9 + 0.1 * variation
+
+    strength    = 1.8   # increase for deeper/darker crack
+    crack_color = img_f.copy()
+    for c in range(3):
+        crack_color[:, :, c] = img_f[:, :, c] * (1.0 - strength * alpha * variation)
+
+    # Absolute clamp — never brighter than original
+    crack_color = np.minimum(crack_color, img_f)
+
+    # 5. Blend and write back strictly inside crack_mask
+    alpha3  = np.stack([alpha, alpha, alpha], axis=-1)
+    blended = img_f * (1.0 - alpha3) + crack_color * alpha3
+    blended = np.minimum(blended, img_f)
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+    mask3 = np.stack([crack_mask, crack_mask, crack_mask], axis=-1) > 0
+    img[mask3] = blended[mask3]
