@@ -66,7 +66,7 @@ def perlin_patch(h, w, scale, perm):
 # ==========================================================================
 # PART B: THE MAIN CRACK-DRAWING FUNCTION
 # ==========================================================================
-def draw_crack(img, x, y, angle, length, depth=CRACK_DEPTH):
+def draw_open_crack(img, x, y, angle, length, depth=CRACK_DEPTH):
     """
     Draws one procedurally generated crack directly onto `img` (in-place).
 
