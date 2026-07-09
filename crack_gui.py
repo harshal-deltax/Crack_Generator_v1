@@ -241,6 +241,112 @@ class RoundedButton(tk.Canvas):
         return self.cget(key)
 
 
+class GraySliderCanvas(tk.Canvas):
+    """A grayscale slider drawn like a Levels-dialog control: a rounded
+    groove filled with a white-to-black gradient, and a round drag handle
+    — the look from the PyQt GraySlider, rebuilt on a Tk Canvas.
+
+    Only supports the horizontal 255 (white, left) -> 0 (black, right)
+    direction this app's Color/Edge scales use, but otherwise drops in
+    like tk.Scale: pass a tk.IntVar as `variable` and an optional
+    `command(value)` callback fired on drag.
+    """
+
+    def __init__(self, parent, variable, command=None, height=32,
+                 bg_parent=BG_PANEL, radius=5, groove_height=10,
+                 handle_radius=8, margin=10):
+        super().__init__(parent, height=height, bg=bg_parent, highlightthickness=0)
+        self.variable = variable
+        self.command = command
+        self.radius = radius
+        self.groove_height = groove_height
+        self.handle_radius = handle_radius
+        self.margin = margin
+        self._height = height
+        self._groove_photo = None
+        self._groove_w = None
+
+        self.bind("<Configure>", self._on_resize)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_press)
+        self.variable.trace_add("write", lambda *a: self._redraw_handle())
+
+    @staticmethod
+    def _rounded_points(x0, y0, x1, y1, r):
+        r = min(r, (x1 - x0) / 2, (y1 - y0) / 2)
+        return [
+            x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
+            x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+            x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
+        ]
+
+    def _on_resize(self, event=None):
+        self._build_groove()
+        self._redraw_handle()
+
+    def _build_groove(self):
+        w = self.winfo_width()
+        gh = self.groove_height
+        groove_w = w - 2 * self.margin
+        if groove_w <= 2:
+            return
+        # White (left) -> black (right) gradient, matching this app's
+        # 255..0 (left..right) scale convention.
+        grad_row = np.linspace(255, 0, groove_w, dtype=np.uint8)
+        arr = np.tile(grad_row, (gh, 1))
+        rgb = np.stack([arr] * 3, axis=-1)
+        grad_img = Image.fromarray(rgb, "RGB")
+        mask = Image.new("L", (groove_w, gh), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, groove_w - 1, gh - 1], radius=min(self.radius, gh // 2), fill=255
+        )
+        rgba = Image.new("RGBA", (groove_w, gh), (0, 0, 0, 0))
+        rgba.paste(grad_img, (0, 0), mask)
+        self._groove_photo = ImageTk.PhotoImage(rgba)
+        self._groove_w = groove_w
+        self._groove_h = gh
+
+        self.delete("groove")
+        y = self._height // 2 - gh // 2
+        self._groove_y = y
+        self.create_image(self.margin, y, anchor="nw", image=self._groove_photo, tags="groove")
+        x0, y0, x1, y1 = self.margin, y, self.margin + groove_w, y + gh
+        pts = self._rounded_points(x0, y0, x1, y1, min(self.radius, gh // 2))
+        self.create_polygon(pts, smooth=True, fill="", outline="#000000", tags="groove")
+        self.tag_lower("groove")
+
+    def _value_to_x(self, value):
+        # value=255 -> left edge, value=0 -> right edge (white -> black)
+        frac = 1 - (value / 255.0)
+        return self.margin + frac * self._groove_w
+
+    def _x_to_value(self, x):
+        if not self._groove_w:
+            return self.variable.get()
+        frac = (x - self.margin) / self._groove_w
+        frac = min(1.0, max(0.0, frac))
+        return int(round((1 - frac) * 255))
+
+    def _redraw_handle(self):
+        if not self._groove_w:
+            return
+        value = self.variable.get()
+        cx = self._value_to_x(value)
+        cy = self._groove_y + self._groove_h / 2
+        r = self.handle_radius
+        self.delete("handle")
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          fill="#dcdcdc", outline="#000000", width=1, tags="handle")
+
+    def _on_press(self, event):
+        value = self._x_to_value(event.x)
+        if value != self.variable.get():
+            self.variable.set(value)
+        self._redraw_handle()
+        if self.command:
+            self.command(value)
+
+
 class ImagePainterApp:
     def __init__(self, root):
         self.root = root
@@ -251,7 +357,8 @@ class ImagePainterApp:
 
         # ---- image / drawing state ----
         self.original_image = None     # PIL.Image, untouched upload
-        self.image = None              # PIL.Image, current working copy
+        self._image = None             # PIL.Image, current working copy (backs the `image` property)
+        self._hist_counts = None       # cached grayscale histogram (256 bins)
         self.tk_image = None           # ImageTk.PhotoImage on screen
         self.image_path = None
 
@@ -259,7 +366,9 @@ class ImagePainterApp:
         self.tool = "crack"            # "brush" | "erase" | "crack" | "edge" | "fill"
         self.brush_size = 1.0          # fractional sizes supported (min 0.25, step 0.25)
         self.brush_color = (30, 28, 26)  # near-black by default
-        self.fill_threshold = 30       # paint-bucket color-match tolerance
+        self.fill_threshold = 10       # paint-bucket: min per-channel diff from
+                                        # the original photo to count a pixel
+                                        # as "part of a crack/edit"
 
         self.undo_stack = []
         self.redo_stack = []
@@ -280,6 +389,17 @@ class ImagePainterApp:
         self.folder_index = -1         # index into the above lists, or -1 if none
 
         self._build_ui()
+
+    # ----------------------------------------------------------------
+    # `image` property
+    # ----------------------------------------------------------------
+    @property
+    def image(self):
+        return self._image
+
+    @image.setter
+    def image(self, value):
+        self._image = value
 
     # ----------------------------------------------------------------
     # UI construction
@@ -508,11 +628,9 @@ class ImagePainterApp:
         self.colorscale_value_label.pack(side="right")
 
         self.color_scale_var = tk.IntVar(value=0)
-        self.color_scale_widget = tk.Scale(
-            top, from_=0, to=255, resolution=1, orient="horizontal",
-            bg=BG_PANEL, fg=TEXT_LIGHT, troughcolor=BTN_BG, highlightthickness=0,
-            activebackground=ACCENT, showvalue=False, variable=self.color_scale_var,
-            command=self._on_colorscale_change,
+        self.color_scale_widget = GraySliderCanvas(
+            top, variable=self.color_scale_var, command=self._on_colorscale_change,
+            bg_parent=BG_PANEL,
         )
         self.color_scale_widget.pack(fill="x", padx=16, pady=(0, 4))
 
@@ -529,11 +647,9 @@ class ImagePainterApp:
         self.edgescale_value_label.pack(side="right")
 
         self.edge_scale_var = tk.IntVar(value=255)
-        self.edge_scale_widget = tk.Scale(
-            top, from_=0, to=255, resolution=1, orient="horizontal",
-            bg=BG_PANEL, fg=TEXT_LIGHT, troughcolor=BTN_BG, highlightthickness=0,
-            activebackground=ACCENT, showvalue=False, variable=self.edge_scale_var,
-            command=self._on_edgescale_change,
+        self.edge_scale_widget = GraySliderCanvas(
+            top, variable=self.edge_scale_var, command=self._on_edgescale_change,
+            bg_parent=BG_PANEL,
         )
         self.edge_scale_widget.pack(fill="x", padx=16, pady=(0, 4))
 
@@ -690,12 +806,64 @@ class ImagePainterApp:
             self.size_value_label.config(text=f"{self.brush_size:.2f}")
 
     def _on_colorscale_change(self, value):
+        gray = int(float(value))
         if hasattr(self, "colorscale_value_label"):
-            self.colorscale_value_label.config(text=str(int(float(value))))
+            self.colorscale_value_label.config(text=str(gray))
+        # Connect the Color scale directly to the Brush / Fill Brush color:
+        # dragging this slider now repaints brush_color as a grayscale
+        # shade, so the Brush and Fill Brush tools use exactly what the
+        # slider shows (in addition to driving the Crack tool's blend
+        # shade, unchanged below).
+        self.brush_color = (gray, gray, gray)
 
     def _on_edgescale_change(self, value):
         if hasattr(self, "edgescale_value_label"):
             self.edgescale_value_label.config(text=str(int(float(value))))
+
+    # ----------------------------------------------------------------
+    # Histogram strips shown above the Color and Edge scales. These
+    # display the current image's grayscale tonal distribution (like a
+    # Levels dialog), oriented to match the reversed sliders below them:
+    # 255 (white) on the left, 0 (black) on the right.
+    # ----------------------------------------------------------------
+    def _update_histograms(self):
+        if self.image is None:
+            self._hist_counts = None
+        else:
+            gray = np.array(self.image.convert("L"))
+            counts, _ = np.histogram(gray, bins=256, range=(0, 256))
+            self._hist_counts = counts
+        for canvas in (
+            getattr(self, "colorscale_hist_canvas", None),
+            getattr(self, "edgescale_hist_canvas", None),
+        ):
+            if canvas is not None:
+                self._draw_histogram(canvas)
+
+    def _draw_histogram(self, canvas):
+        canvas.delete("hist")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        counts = self._hist_counts
+        if counts is None or counts.max() == 0:
+            return
+        peak = counts.max()
+        n_bins = len(counts)
+        bar_w = w / n_bins
+        for g in range(n_bins):
+            bar_h = (counts[g] / peak) * (h - 2)
+            if bar_h <= 0:
+                continue
+            # g=255 (white) drawn at the left edge, g=0 (black) at the
+            # right edge, matching the from_=255..to=0 scale below it.
+            x0 = (255 - g) / 255 * w
+            x1 = x0 + bar_w + 0.6
+            canvas.create_rectangle(
+                x0, h - bar_h, x1, h,
+                fill=TEXT_DIM, outline="", tags="hist",
+            )
 
     def pick_color(self):
         """Color Picker button. Like pickcoloronline.com, this first tries
@@ -720,7 +888,10 @@ class ImagePainterApp:
     def _apply_picked_color(self, rgb):
         """Shared by both the eyedropper and the dialog fallback: sets the
         brush color and keeps the Crack/Edge grayscale sliders roughly
-        matched to the picked color's brightness (same behavior as before)."""
+        matched to the picked color's brightness (same behavior as before).
+        Also connects the Color Picker straight to the Fill Brush tool:
+        as soon as a color is picked, Fill Brush is auto-selected so the
+        very next click on the image floods with that color."""
         self.brush_color = tuple(int(c) for c in rgb)
         gray = int(round(0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]))
         gray = max(0, min(255, gray))
@@ -730,6 +901,7 @@ class ImagePainterApp:
             self.colorscale_value_label.config(text=str(gray))
         if hasattr(self, "edgescale_value_label"):
             self.edgescale_value_label.config(text=str(gray))
+        self.select_tool("fill")
 
     def _start_eyedropper(self):
         """Screen-wide eyedropper (pickcoloronline.com-style): grabs a
@@ -1019,6 +1191,8 @@ class ImagePainterApp:
             self.zoom_slider.set(int(round(self.zoom * 100)))
             self._zoom_sync_lock = False
         self._update_status()
+        if not fast:
+            self._update_histograms()
 
     def zoom_in(self):
         if self.image is None:
@@ -1153,8 +1327,57 @@ class ImagePainterApp:
         depth = max(1, round(self.brush_size))
         color = self.color_scale_var.get()
         arr = np.array(self.image)  # RGB uint8 HxWx3 - channel order doesn't
+        arr_before = arr.copy()
         draw_crack(arr, start_point[0], start_point[1], angle, length, depth=depth, color=color)
+
+        # Figure out exactly which pixels draw_crack actually darkened, so
+        # the endpoint tint below can be clipped to *only* those pixels -
+        # otherwise a plain circular dab spills the Brush Color onto the
+        # normal, untouched surface around each tip instead of staying on
+        # the crack line itself.
+        diff = cv2.absdiff(arr, arr_before)
+        crack_mask_full = (diff.max(axis=2) > 2).astype(np.uint8) * 255
+
         self.image = Image.fromarray(arr)
+
+        end_point = (
+            start_point[0] + length * math.cos(math.radians(angle)),
+            start_point[1] + length * math.sin(math.radians(angle)),
+        )
+        self._fill_color_dab(start_point, self.brush_color, depth, crack_mask_full)
+        self._fill_color_dab(end_point, self.brush_color, depth, crack_mask_full)
+
+    def _fill_color_dab(self, point, color, depth, crack_mask_full=None):
+        """Blends `color` into self.image as a soft, feathered dab centered
+        on `point` (image coordinates). If `crack_mask_full` is given (a
+        full-image 0/255 mask of pixels the crack algorithm just darkened),
+        the dab is clipped to that mask so the color only lands on the
+        crack itself, not the surrounding image."""
+        if self.image is None:
+            return
+        r = max(1.5, depth * 1.5)  # local search radius around the tip
+        x, y = point
+        pad = int(r + self._feather_sigma() * 3) + 2
+        left, top = int(x - r) - pad, int(y - r) - pad
+        right, bottom = int(x + r) + pad, int(y + r) + pad
+        left, top = max(0, left), max(0, top)
+        right = min(self.image.width, right)
+        bottom = min(self.image.height, bottom)
+        if right <= left or bottom <= top:
+            return
+        mask = Image.new("L", (right - left, bottom - top), 0)
+        ImageDraw.Draw(mask).ellipse(
+            [x - left - r, y - top - r, x - left + r, y - top + r], fill=255
+        )
+        mask_np = np.array(mask)
+        if crack_mask_full is not None:
+            local_crack = crack_mask_full[top:bottom, left:right]
+            # Dilate a touch so the tint fully covers the crack's own soft
+            # feathered edge instead of leaving a thin untinted sliver.
+            local_crack = cv2.dilate(local_crack, np.ones((3, 3), np.uint8), iterations=1)
+            mask_np = cv2.bitwise_and(mask_np, local_crack)
+        mask_np = cv2.GaussianBlur(mask_np, (0, 0), sigmaX=self._feather_sigma())
+        self._blend_region((left, top, right, bottom), mask_np, color)
 
     def _apply_edge_stroke(self, start_point, angle, length):
         """Runs draw_edge_stroke on the current image, starting at
@@ -1188,19 +1411,57 @@ class ImagePainterApp:
         return max(0.6, self.brush_size * 0.12)
 
     def _flood_fill(self, point):
-        """Paint-bucket fill, the same idea as the Fill tool in Paint:
-        starting at the clicked pixel, floods the connected region of
-        similar color with the current brush color, stopping at edges/
-        outlines (e.g. a crack you already drew) the way a paint app's
-        bucket tool does. self.fill_threshold controls how close a
-        neighboring pixel's color must be to count as "the same region"."""
-        if self.image is None:
+        """Paint-bucket fill for the crack under the click.
+
+        THE PROBLEM: the previous version used cv2.floodFill, which grows
+        outward from the clicked pixel by *color similarity* (any
+        neighboring pixel within fill_threshold of the seed color counts
+        as "the same region"). That works great on flat, cartoon-flat
+        images, but a real photo (concrete, road, wall, etc.) has enough
+        natural texture/noise that huge swathes of the surrounding surface
+        fall within that same tolerance - so the fill leaked across the
+        whole photo instead of stopping at the crack's edges.
+
+        THE FIX: don't use color similarity at all. Instead, compare the
+        current image to self.original_image (the untouched upload) to
+        get a mask of every pixel any crack/edge stroke has ever darkened,
+        then take just the one connected patch of that mask under the
+        click (cv2.connectedComponents) - that's exactly this one crack,
+        regardless of how visually similar its color is to the rest of the
+        photo. Clicking on plain, unedited photo (nothing to fill) is a
+        no-op.
+        """
+        if self.image is None or self.original_image is None:
+            messagebox.showinfo("No image", "Please upload an image first.")
             return
         x, y = int(round(point[0])), int(round(point[1]))
         w, h = self.image.size
         if not (0 <= x < w and 0 <= y < h):
             return
-        ImageDraw.floodfill(self.image, (x, y), self.brush_color, thresh=self.fill_threshold)
+
+        current = np.array(self.image)
+        original = np.array(self.original_image)
+        if current.shape != original.shape:
+            return  # sizes always match in normal use; just a safety net
+
+        # Every pixel that differs meaningfully from the untouched photo -
+        # i.e. every crack/edge stroke drawn anywhere on the image so far.
+        diff = cv2.absdiff(current, original)
+        edited = (diff.max(axis=2) > self.fill_threshold).astype(np.uint8)
+
+        if edited[y, x] == 0:
+            return  # clicked on plain photo, not on a crack - nothing to do
+
+        # Isolate just the connected patch under the click (this one
+        # crack), not every crack/edit drawn elsewhere on the image.
+        _num_labels, labels = cv2.connectedComponents(edited, connectivity=8)
+        component_mask = (labels == labels[y, x]).astype(np.uint8) * 255
+
+        # Feather slightly so the color blends into the crack's soft edge
+        # instead of leaving a hard, jagged cutout.
+        component_mask = cv2.GaussianBlur(component_mask, (0, 0), sigmaX=1.0)
+
+        self._blend_region((0, 0, w, h), component_mask, self.brush_color)
 
     def _draw_dab(self, point):
         r = max(0.5, self.brush_size / 2)
